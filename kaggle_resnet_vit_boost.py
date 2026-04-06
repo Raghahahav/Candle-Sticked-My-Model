@@ -14,7 +14,6 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
-from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import models, transforms
 from torchvision.transforms import InterpolationMode
@@ -29,16 +28,17 @@ else:
     TRANSFORMERS_IMPORT_ERROR = None
 
 
-CLASS_NAMES = ["down", "neutral", "up"]
-LABEL_TO_ID = {label: idx for idx, label in enumerate(CLASS_NAMES)}
+DEFAULT_CLASS_ORDER = ("down", "neutral", "up")
 
 
 @dataclass
 class TrainConfig:
     data_root: str | None = None
+    metadata_csv: str | None = None
     checkpoint_dir: str = "/kaggle/working/candlestick_runs"
     model_family: str = "resnet50"  # "resnet50" or "deit"
     vit_checkpoint: str = "facebook/deit-base-patch16-224"
+    class_names: tuple[str, ...] | None = None
     image_size: int = 320
     batch_size: int = 32
     epochs: int = 14
@@ -57,6 +57,7 @@ class TrainConfig:
     crop_margin_px: int = 8
     weighted_sampler: bool = True
     amp: bool = True
+    respect_existing_split: bool = True
 
 
 def seed_everything(seed: int) -> None:
@@ -94,6 +95,14 @@ def detect_data_root(config: TrainConfig) -> Path:
     raise FileNotFoundError(f"Could not locate stock_dataset. Tried:\n{joined}")
 
 
+def infer_class_names(labels: pd.Series, preferred_order: tuple[str, ...] | None = None) -> list[str]:
+    preferred = preferred_order or DEFAULT_CLASS_ORDER
+    unique = [str(label) for label in pd.Index(labels).dropna().unique().tolist()]
+    ordered = [label for label in preferred if label in unique]
+    ordered.extend(sorted(label for label in unique if label not in ordered))
+    return ordered
+
+
 def _resolve_image_path(data_root: Path, image_path: str, stock: str) -> Path:
     filename = Path(image_path).name
     candidates = [
@@ -108,17 +117,42 @@ def _resolve_image_path(data_root: Path, image_path: str, stock: str) -> Path:
 
 def load_metadata(config: TrainConfig) -> pd.DataFrame:
     data_root = detect_data_root(config)
-    df = pd.read_csv(data_root / "labels.csv")
+    csv_path = Path(config.metadata_csv) if config.metadata_csv else data_root / "labels.csv"
+    df = pd.read_csv(csv_path)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df["label"] = df["label"].str.lower()
-    df = df[df["label"].isin(CLASS_NAMES)].copy()
-    df["label_id"] = df["label"].map(LABEL_TO_ID)
+    class_names = list(config.class_names) if config.class_names else infer_class_names(df["label"])
+    label_to_id = {label: idx for idx, label in enumerate(class_names)}
+    df = df[df["label"].isin(class_names)].copy()
+    df["label_id"] = df["label"].map(label_to_id)
     df["image_idx"] = df["image_path"].str.extract(r"_(\d+)\.png$").astype(int)
-    df["resolved_path"] = [
-        str(_resolve_image_path(data_root, image_path, stock))
-        for image_path, stock in zip(df["image_path"], df["stock"])
-    ]
+
+    if "resolved_path" in df.columns:
+        resolved_paths = []
+        for image_path, resolved_path, stock in zip(df["image_path"], df["resolved_path"], df["stock"]):
+            candidate = Path(str(resolved_path))
+            if str(resolved_path).strip() and candidate.exists():
+                resolved_paths.append(str(candidate.resolve()))
+            else:
+                resolved_paths.append(str(_resolve_image_path(data_root, image_path, stock)))
+        df["resolved_path"] = resolved_paths
+    else:
+        df["resolved_path"] = [
+            str(_resolve_image_path(data_root, image_path, stock))
+            for image_path, stock in zip(df["image_path"], df["stock"])
+        ]
     return df.sort_values(["stock", "timestamp", "image_idx"]).reset_index(drop=True)
+
+
+def prepare_split_df(df: pd.DataFrame, config: TrainConfig) -> pd.DataFrame:
+    if (
+        config.respect_existing_split
+        and "split" in df.columns
+        and {"train", "val", "test"}.issubset(set(df["split"].dropna().unique()))
+    ):
+        return df[df["split"].isin(["train", "val", "test"])].copy().reset_index(drop=True)
+
+    return build_purged_time_split(df, gap=config.purge_gap)
 
 
 def build_purged_time_split(
@@ -147,7 +181,7 @@ def build_purged_time_split(
     return out[out["split"] != "gap"].reset_index(drop=True)
 
 
-def dataset_diagnostics(df: pd.DataFrame, config: TrainConfig) -> dict[str, Any]:
+def dataset_diagnostics(df: pd.DataFrame, config: TrainConfig, class_names: list[str]) -> dict[str, Any]:
     report: dict[str, Any] = {}
     report["rows"] = int(len(df))
     report["stocks"] = int(df["stock"].nunique())
@@ -172,9 +206,7 @@ def dataset_diagnostics(df: pd.DataFrame, config: TrainConfig) -> dict[str, Any]
         flip_rates.append(float(flips.mean()))
     report["adjacent_window_flip_rate_pct"] = round(float(np.mean(flip_rates) * 100), 2)
 
-    split_counts = (
-        df.groupby(["split", "label"]).size().unstack(fill_value=0).reindex(CLASS_NAMES, axis=1)
-    )
+    split_counts = df.groupby(["split", "label"]).size().unstack(fill_value=0).reindex(class_names, axis=1)
     report["split_counts"] = split_counts.to_dict(orient="index")
     return report
 
@@ -353,7 +385,7 @@ def _set_trainable(module: nn.Module, enabled: bool) -> None:
         param.requires_grad = enabled
 
 
-def build_model(config: TrainConfig, device: torch.device) -> nn.Module:
+def build_model(config: TrainConfig, device: torch.device, num_classes: int, class_names: list[str]) -> nn.Module:
     if config.model_family == "resnet50":
         weights = models.ResNet50_Weights.IMAGENET1K_V2
         model = models.resnet50(weights=weights)
@@ -367,7 +399,7 @@ def build_model(config: TrainConfig, device: torch.device) -> nn.Module:
             nn.Linear(in_features, 512),
             nn.ReLU(inplace=True),
             nn.Dropout(p=0.2),
-            nn.Linear(512, len(CLASS_NAMES)),
+            nn.Linear(512, num_classes),
         )
         return model.to(device)
 
@@ -379,9 +411,9 @@ def build_model(config: TrainConfig, device: torch.device) -> nn.Module:
 
         model = AutoModelForImageClassification.from_pretrained(
             config.vit_checkpoint,
-            num_labels=len(CLASS_NAMES),
-            id2label={idx: label for idx, label in enumerate(CLASS_NAMES)},
-            label2id=LABEL_TO_ID,
+            num_labels=num_classes,
+            id2label={idx: label for idx, label in enumerate(class_names)},
+            label2id={label: idx for idx, label in enumerate(class_names)},
             ignore_mismatched_sizes=True,
         )
         _set_trainable(model, False)
@@ -456,7 +488,7 @@ def run_epoch(
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=amp_enabled):
+        with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
             logits = forward_logits(model, images, config)
             loss = criterion(logits, labels)
 
@@ -496,7 +528,7 @@ def evaluate_with_outputs(
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        with autocast(enabled=amp_enabled):
+        with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
             logits = forward_logits(model, images, config)
             loss = criterion(logits, labels)
 
@@ -515,20 +547,23 @@ def evaluate_with_outputs(
 def train_model(config: TrainConfig) -> dict[str, Any]:
     seed_everything(config.seed)
     device = get_device()
-    split_df = build_purged_time_split(load_metadata(config), gap=config.purge_gap)
-    diagnostics = dataset_diagnostics(split_df, config)
+    metadata_df = load_metadata(config)
+    class_names = list(config.class_names) if config.class_names else infer_class_names(metadata_df["label"])
+    split_df = prepare_split_df(metadata_df, config)
+    diagnostics = dataset_diagnostics(split_df, config, class_names)
     diagnostics["image_stats"] = get_image_stats(split_df)
 
     train_loader, val_loader, test_loader, train_df, val_df, test_df = build_dataloaders(split_df, config)
-    model = build_model(config, device)
+    model = build_model(config, device, num_classes=len(class_names), class_names=class_names)
     optimizer = build_optimizer(model, config)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs, eta_min=1e-6)
     criterion = nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
-    scaler = GradScaler(enabled=bool(config.amp and device.type == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=bool(config.amp and device.type == "cuda"))
 
     checkpoint_dir = Path(config.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    run_name = f"{config.model_family}_{config.image_size}px_gap{config.purge_gap}"
+    label_tag = "-".join(class_names)
+    run_name = f"{config.model_family}_{config.image_size}px_gap{config.purge_gap}_{label_tag}"
     checkpoint_path = checkpoint_dir / f"{run_name}.pt"
 
     history: list[dict[str, float]] = []
@@ -566,6 +601,7 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
                 "model_state": copy.deepcopy(model.state_dict()),
                 "config": asdict(config),
                 "diagnostics": diagnostics,
+                "class_names": class_names,
             }
             torch.save(best_state, checkpoint_path)
         else:
@@ -598,7 +634,8 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
             "classification_report": classification_report(
                 val_targets,
                 val_preds,
-                target_names=CLASS_NAMES,
+                labels=list(range(len(class_names))),
+                target_names=class_names,
                 digits=4,
                 output_dict=True,
             ),
@@ -608,11 +645,16 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
             "classification_report": classification_report(
                 test_targets,
                 test_preds,
-                target_names=CLASS_NAMES,
+                labels=list(range(len(class_names))),
+                target_names=class_names,
                 digits=4,
                 output_dict=True,
             ),
-            "confusion_matrix": confusion_matrix(test_targets, test_preds).tolist(),
+            "confusion_matrix": confusion_matrix(
+                test_targets,
+                test_preds,
+                labels=list(range(len(class_names))),
+            ).tolist(),
         },
     }
 
@@ -658,11 +700,12 @@ def plot_confusion(report: dict[str, Any], split: str = "test") -> None:
     import matplotlib.pyplot as plt
     import seaborn as sns
 
+    class_names = list(report["config"].get("class_names") or infer_class_names(pd.Series(report["splits"]["train"].keys())))
     cm = np.asarray(report[split]["confusion_matrix"])
     cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=axes[0])
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=class_names, yticklabels=class_names, ax=axes[0])
     axes[0].set_title(f"{split.title()} Confusion Matrix")
     axes[0].set_xlabel("Predicted")
     axes[0].set_ylabel("True")
@@ -674,8 +717,8 @@ def plot_confusion(report: dict[str, Any], split: str = "test") -> None:
         cmap="RdYlGn",
         vmin=0,
         vmax=1,
-        xticklabels=CLASS_NAMES,
-        yticklabels=CLASS_NAMES,
+        xticklabels=class_names,
+        yticklabels=class_names,
         ax=axes[1],
     )
     axes[1].set_title(f"{split.title()} Confusion Matrix (normalized)")
