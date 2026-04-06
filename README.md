@@ -1,4 +1,4 @@
-# Candlestick ViT — Stock Trend Prediction using Vision Transformer & XAI
+# Candlestick Stock Trend Prediction
 
 > **Group 1 Assignment** | Deep Learning Framework for Stock Trend Prediction via Candlestick Chart Image Classification
 
@@ -6,7 +6,7 @@
 
 ## 📌 Project Overview
 
-This project transforms financial time-series data into candlestick chart images and frames stock trend prediction as an **image classification problem**. A **Vision Transformer (ViT)** is trained on these images, and **Explainable AI (XAI)** techniques are applied to interpret what patterns the model learns.
+This project transforms financial time-series data into candlestick chart images and frames stock trend prediction as an **image classification problem**. I originally started with a ViT-first approach, then shifted to stronger data-signal and CNN/DeiT experiments after the early results showed the dataset itself was the main bottleneck.
 
 **Target Market**: NSE (National Stock Exchange of India)  
 **Data Source**: Yahoo Finance API via `yfinance`  
@@ -21,11 +21,13 @@ This project transforms financial time-series data into candlestick chart images
 | 1 | Data Collection & Preprocessing | ✅ Done |
 | 2 | Labeling Strategy | ✅ Done |
 | 3 | Dataset Preparation | ✅ Done |
-| 4 | Model Implementation (ViT) | 🔲 Pending |
-| 5 | Explainability (XAI / Attention / Grad-CAM) | 🔲 Pending |
-| 6 | Evaluation & Analysis | 🔲 Pending |
-| 7 | Comparative Study | 🔲 Pending |
-| 8 | Final Report | 🔲 Pending |
+| 4 | Baseline Model Implementation | ✅ Done |
+| 5 | Label Signal Boost / Binary Target Experiments | ✅ Done |
+| 6 | ResNet50 Training | ✅ Done |
+| 7 | DeiT / ViT Training | ✅ Done |
+| 8 | Evaluation & Comparison | ✅ Done |
+| 9 | Explainability (XAI / Attention / Grad-CAM) | 🔲 Pending |
+| 10 | Final Report | 🔲 Pending |
 
 ---
 
@@ -34,9 +36,13 @@ This project transforms financial time-series data into candlestick chart images
 ```
 candlestick-vit/
 │
-├── Data_Collection_and_Preprocessing_take_3.ipynb   # Phase 1: Fetch & preprocess OHLC data
+├── Data_Collection_and_Preprocessing_final.ipynb     # Phase 1: Fetch & preprocess OHLC data
 ├── Labelling_Strategy.ipynb                          # Phase 2: Label generation pipeline
-├── Dataset_Preparation.ipynb                         # Phase 3: Train/val/test split & folder org
+├── Dataset_Preparation.ipynb                        # Phase 3: Train/val/test split & folder org
+├── kaggle_resnet_vit_boost.py                       # Kaggle training utilities for ResNet/DeiT
+├── dataset_signal_boost.py                          # Stronger label-signal and metadata builder
+├── 4-kaggle-resnet-vit-improved.ipynb               # Training notebook for model comparison
+├── 5-label-signal-boost.ipynb                       # Label rebuild + ResNet/DeiT training notebook
 │
 ├── stock_dataset/
 │   ├── raw_images/                  # Candlestick images organized by stock
@@ -189,7 +195,7 @@ return = (close_next_trading_day - close_today) / close_today
 | **Neutral** | 3,680 | 19.50% |
 | **Total** | **18,867** | 100% |
 
-> **Note**: Dataset exhibits a natural bearish bias. Class weights or stratified sampling are recommended during training.
+> **Note**: The original 3-class labels were still noisy for model learning. I later added stronger signal experiments that rebuild metadata with binary or quantile-based labels and purge-gap splits to reduce leakage.
 
 ### Suggested Class Weights for Training
 
@@ -211,6 +217,7 @@ class_weights = {
 
 ### Output
 - `stock_dataset/labels.csv` — columns: `image_path`, `label`, `stock`, `timestamp`
+- `dataset_signal_boost.py` can rebuild improved metadata CSVs with binary or quantile labels
 - ~20 seconds execution time for all 50 stocks
 
 ---
@@ -252,12 +259,30 @@ stock_dataset/
 
 ---
 
-## 🔲 Phase 4: Model Implementation (ViT) — Pending
+## ✅ Phase 4: Model Implementation
 
-### Plan
-- Implement **Vision Transformer (ViT)** using PyTorch
-- Use pretrained weights (e.g., `google/vit-base-patch16-224` from HuggingFace)
-- Fine-tune on candlestick image dataset
+### What was done
+- Implemented **ResNet50** fine-tuning as the strongest baseline
+- Implemented **DeiT / ViT** fine-tuning for comparison
+- Added cosine LR scheduling, AMP, class balancing, and better image preprocessing
+- Added a second-generation notebook flow to compare raw 3-class labels with stronger binary label signal
+
+### Key Files
+- [`kaggle_resnet_vit_boost.py`](/Users/sures/Downloads/untitled folder/Candle-Sticked-My-Model/kaggle_resnet_vit_boost.py)
+- [`dataset_signal_boost.py`](/Users/sures/Downloads/untitled folder/Candle-Sticked-My-Model/dataset_signal_boost.py)
+- [`4-kaggle-resnet-vit-improved.ipynb`](/Users/sures/Downloads/untitled folder/Candle-Sticked-My-Model/4-kaggle-resnet-vit-improved.ipynb)
+- [`5-label-signal-boost.ipynb`](/Users/sures/Downloads/untitled folder/Candle-Sticked-My-Model/5-label-signal-boost.ipynb)
+
+### Best current direction
+- Use binary labels first: `up` vs `down`
+- Train ResNet50 before DeiT
+- Keep the purge gap in splits to avoid overlap leakage
+- Crop away empty chart margins before resize
+
+### Current result
+- The label-signal boost notebook is the active path and gives the best practical results so far
+- ResNet50 is the most reliable model for this dataset at the moment
+- DeiT / ViT is still useful as a comparison, but it is not the main production choice
 - Handle class imbalance via weighted loss or oversampling
 - Hyperparameter tuning: learning rate, batch size, patch size, number of heads
 
