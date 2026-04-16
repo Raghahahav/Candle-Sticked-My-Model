@@ -26,8 +26,8 @@ This project transforms financial time-series data into candlestick chart images
 | 6 | ResNet50 Training | ✅ Done |
 | 7 | DeiT / ViT Training | ✅ Done |
 | 8 | Evaluation & Comparison | ✅ Done |
-| 9 | Explainability (XAI / Attention / Grad-CAM) | 🔲 Pending |
-| 10 | Final Report | 🔲 Pending |
+| 9 | Explainability (XAI / Attention / Grad-CAM) | Done |
+| 10 | Final Report | done |
 
 ---
 
